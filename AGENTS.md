@@ -160,6 +160,27 @@ This repository's own decisions go in `docs/adr/`.
   `bash "$RULES/scripts/check-conventions.sh" "$RULES/common-rules.md"`, from the root.
 - `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
   `cargo test --workspace`, and `cargo deny --config "$RULES/deny.toml" check`. On Windows, set
-  `OPENSSL_DIR`. No CI runs the Rust checks yet: run them locally before pushing.
+  `OPENSSL_DIR`. The pull request CI runs the conventions only (the reusable Rust workflow has no
+  webview libraries); the release workflow runs the Rust checks: run them locally before pushing.
+
+### Releasing
+
+A tag `vX.Y.Z` runs `.github/workflows/release.yml`: the Linux checks and lightness budget, one
+build per system with the tag's version (updater archives signed with minisign; macOS signed with
+the Developer ID certificate and notarised), then `release/assemble.mjs` writes `latest.json` (the
+updater manifest the apps read at `https://ruchoir.com/desktop/latest.json`), `downloads.json` and
+`index.html`, `SHA256SUMS.txt` is signed with the release GPG key, and the whole goes to the
+website's server through the `deploy` account. On the server, `release/desktop-publish-entry` is the
+key's forced command and `release/desktop-publish` places the files under `/srv/ruchoir-desktop/`.
+
+The repository has no Actions minutes yet: the workflow runs once billing or a self-hosted runner
+exists. It needs these, recreated in the repository's settings (never in a file):
+
+- Secrets: `TAURI_SIGNING_PRIVATE_KEY`, `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` (the updater key whose
+  public half is in `src-tauri/tauri.conf.json`), `APPLE_CERTIFICATE`,
+  `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, `APPLE_API_ISSUER_ID`, `APPLE_API_KEY_ID`,
+  `APPLE_API_KEY_P8`; in an environment named `production`: `RELEASE_GPG_KEY`,
+  `RELEASE_GPG_PASSPHRASE`, `DESKTOP_DEPLOY_SSH_KEY`, `DEPLOY_KNOWN_HOSTS`.
+- Variable: `DEPLOY_HOST`, the website's server.
 
 Licence: `AGPL-3.0-only` (`LICENSE`).
