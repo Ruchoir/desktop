@@ -1,0 +1,19 @@
+# Cargo workspace of the desktop app (Windows, macOS, Linux): the core (no window) and the Tauri app.
+[workspace]
+resolver = "2"
+members = ["core", "src-tauri"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.96"
+license = "AGPL-3.0-only"
+repository = "https://github.com/Ruchoir/desktop"
+version = "0.1.0"
+
+# The app must stay light (spec, "Lightness budget"): small, stripped, no unwinding tables.
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
