@@ -1,0 +1,213 @@
+name: Release
+
+# The desktop app for Windows, macOS and Linux, released on a tag `vX.Y.Z` only (AGENTS.md,
+# "Releasing"): checks and the lightness budget on Linux, one signed build per system, then the
+# files, the signed updater manifest and the download page published on ruchoir.com/desktop. Never
+# GitHub releases: an installed app talks to Ruchoir's own server only.
+#
+# The repository is private and its Actions have no minutes for now: this workflow is written to run
+# once billing or a self-hosted runner exists. Until then, a release is built by hand.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  TAURI_CLI: "@tauri-apps/cli@2.12.3"
+
+jobs:
+  checks:
+    name: Checks and lightness budget (Linux)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7.0.1
+      - name: System libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
+            libsecret-1-dev xvfb dbus-x11 xdg-utils desktop-file-utils
+      - name: Set up Rust
+        run: rustup show
+      - name: Set up Node
+        uses: actions/setup-node@v7.1.0
+        with:
+          node-version-file: .nvmrc
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --workspace
+      - name: Release build
+        run: npx --yes "$TAURI_CLI" build --no-bundle
+      - name: Lightness budget
+        run: RUCHOIR_DESKTOP_BIN="$PWD/target/release/ruchoir-desktop" e2e/budget.sh
+
+  build:
+    name: Build (${{ matrix.name }})
+    needs: checks
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-22.04
+            args: --bundles appimage,deb,rpm
+            artifacts: target/release/bundle/
+          - name: Windows
+            os: windows-latest
+            args: --bundles nsis
+            artifacts: target/release/bundle/nsis/
+          - name: macOS
+            os: macos-latest
+            args: --target universal-apple-darwin --bundles app,dmg
+            artifacts: target/universal-apple-darwin/release/bundle/
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7.0.1
+      - name: System libraries (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
+            libsecret-1-dev
+      - name: Set up Rust
+        run: |
+          rustup show
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          fi
+      - name: Set up Node
+        uses: actions/setup-node@v7.1.0
+        with:
+          node-version-file: .nvmrc
+      - name: Build
+        env:
+          # The updater's archives are signed with the minisign key whose public half is in
+          # src-tauri/tauri.conf.json: an app refuses an update without it.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # macOS: signed with the Developer ID Application certificate, then notarised with the
+          # App Store Connect key. Tauri reads these, and they are empty on the other systems.
+          APPLE_CERTIFICATE: ${{ runner.os == 'macOS' && secrets.APPLE_CERTIFICATE || '' }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ runner.os == 'macOS' && secrets.APPLE_CERTIFICATE_PASSWORD || '' }}
+          APPLE_SIGNING_IDENTITY: ${{ runner.os == 'macOS' && secrets.APPLE_SIGNING_IDENTITY || '' }}
+          APPLE_API_ISSUER: ${{ runner.os == 'macOS' && secrets.APPLE_API_ISSUER_ID || '' }}
+          APPLE_API_KEY: ${{ runner.os == 'macOS' && secrets.APPLE_API_KEY_ID || '' }}
+          APPLE_API_KEY_P8: ${{ runner.os == 'macOS' && secrets.APPLE_API_KEY_P8 || '' }}
+        run: |
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "::error::The TAURI_SIGNING_PRIVATE_KEY secret is missing: see AGENTS.md, \"Releasing\"."
+            exit 1
+          fi
+          if [ -n "$APPLE_API_KEY_P8" ]; then
+            # Tauri's notarisation reads the App Store Connect key from a file.
+            export APPLE_API_KEY_PATH="$RUNNER_TEMP/AuthKey_$APPLE_API_KEY.p8"
+            (umask 077; printf '%s\n' "$APPLE_API_KEY_P8" > "$APPLE_API_KEY_PATH")
+          fi
+          version="${GITHUB_REF_NAME#v}"
+          npx --yes "$TAURI_CLI" build ${{ matrix.args }} \
+            -c "{\"version\":\"$version\",\"bundle\":{\"createUpdaterArtifacts\":true}}"
+      - name: Check the signature (macOS)
+        # The app must carry the Developer ID signature and Apple's notarisation ticket, or
+        # Gatekeeper stops it at the first open: the release stops here instead.
+        if: runner.os == 'macOS'
+        run: |
+          app=$(find target/universal-apple-darwin/release/bundle/macos -maxdepth 1 -name "*.app" | head -1)
+          codesign --verify --deep --strict --verbose=2 "$app"
+          spctl --assess --type execute --verbose=4 "$app"
+          xcrun stapler validate "$app"
+      - name: Lightness, measured (Windows and macOS)
+        # Reported, not enforced: these runners have no GPU, so the figures are an upper bound.
+        if: runner.os != 'Linux'
+        continue-on-error: true
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            bin=target/release/ruchoir-desktop.exe
+          else
+            bin=target/universal-apple-darwin/release/ruchoir-desktop
+          fi
+          node e2e/budget-report.mjs "$bin" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Remove the key
+        if: always()
+        run: rm -f "$RUNNER_TEMP"/AuthKey_*.p8
+      - name: Upload the build
+        uses: actions/upload-artifact@v4
+        with:
+          name: ruchoir-desktop-${{ matrix.name }}
+          path: ${{ matrix.artifacts }}
+          retention-days: 7
+
+  publish:
+    name: Publish (ruchoir.com/desktop)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7.0.1
+      - name: Fetch every system's build
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ruchoir-desktop-*
+          path: gathered
+      - name: Gather the release's files
+        run: |
+          mkdir dist
+          find gathered -type f \( -name '*-setup.exe' -o -name '*-setup.exe.sig' \
+            -o -name '*.app.tar.gz' -o -name '*.app.tar.gz.sig' -o -name '*.AppImage' \
+            -o -name '*.AppImage.sig' -o -name '*.dmg' -o -name '*.deb' -o -name '*.rpm' \) \
+            -exec cp {} dist/ \;
+          ls -la dist
+      - name: Set up Node
+        uses: actions/setup-node@v7.1.0
+        with:
+          node-version-file: .nvmrc
+      - name: Write the updater manifest and the download page
+        run: node release/assemble.mjs "${GITHUB_REF_NAME#v}" dist
+      - name: Sign the checksums
+        # SHA256SUMS.txt holds every file's checksum, signed with Ruchoir's release key, whose public
+        # half ships beside it.
+        env:
+          RELEASE_GPG_KEY: ${{ secrets.RELEASE_GPG_KEY }}
+          RELEASE_GPG_PASSPHRASE: ${{ secrets.RELEASE_GPG_PASSPHRASE }}
+        run: |
+          export GNUPGHOME="$RUNNER_TEMP/gnupg"
+          install -d -m 700 "$GNUPGHOME"
+          printf '%s\n' "$RELEASE_GPG_KEY" | gpg --batch --import
+          printf '%s' "$RELEASE_GPG_PASSPHRASE" > "$GNUPGHOME/passphrase"
+          cd dist
+          find . -maxdepth 1 -type f ! -name '*.sig' ! -name 'latest.json' ! -name 'downloads.json' \
+            ! -name 'index.html' ! -name 'SHA256SUMS*' -printf '%f\n' | sort | xargs sha256sum > SHA256SUMS.txt
+          gpg --batch --pinentry-mode loopback --passphrase-file "$GNUPGHOME/passphrase" \
+            --armor --detach-sign --output SHA256SUMS.txt.asc SHA256SUMS.txt
+          gpg --verify SHA256SUMS.txt.asc SHA256SUMS.txt
+          cp ../release/ruchoir-release.asc .
+          rm -rf "$GNUPGHOME"
+      - name: Publish through the deploy account
+        # The key is bound on the server to release/desktop-publish-entry: it can place a release
+        # and do nothing else.
+        env:
+          DESKTOP_DEPLOY_SSH_KEY: ${{ secrets.DESKTOP_DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$DESKTOP_DEPLOY_SSH_KEY" > ~/.ssh/deploy
+          chmod 600 ~/.ssh/deploy
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          tar -cf release.tar -C dist .
+          ssh -i ~/.ssh/deploy -o IdentitiesOnly=yes -o BatchMode=yes "deploy@$DEPLOY_HOST" \
+            "$GITHUB_REF_NAME" < release.tar
+          rm -f ~/.ssh/deploy
