@@ -1,7 +1,8 @@
-//! Where session tokens live: the system's keychain (macOS Keychain, Windows Credential Manager,
-//! the Secret Service on Linux), one entry per instance id.
+//! Where the grants live: the system's keychain (macOS Keychain, Windows Credential Manager, the
+//! Secret Service on Linux). [`Keychain`] is the `Storage` `ruchoir-native` files its refresh
+//! tokens in, one entry per key it chooses.
 //!
-//! A Linux desktop may have no Secret Service at all. The app then keeps tokens in memory only, for
+//! A Linux desktop may have no Secret Service at all. The app then keeps grants in memory only, for
 //! the life of the process, and says so once: a token is never written to a plain file.
 
 use std::collections::HashMap;
@@ -115,9 +116,56 @@ pub fn open_vault_with(probe: impl FnOnce() -> bool) -> Box<dyn TokenVault> {
     }
 }
 
+/// The keychain (or memory, without one) as `ruchoir-native` stores in it.
+pub struct Keychain(Box<dyn TokenVault>);
+
+impl Keychain {
+    /// The system's keychain if it works, else memory.
+    pub fn open() -> Self {
+        Self(open_vault())
+    }
+
+    /// Over a given vault (tests).
+    pub fn with(vault: Box<dyn TokenVault>) -> Self {
+        Self(vault)
+    }
+
+    /// Whether a grant survives quitting the app.
+    pub fn persistent(&self) -> bool {
+        self.0.persistent()
+    }
+}
+
+impl ruchoir_native::Storage for Keychain {
+    async fn get(&self, key: &str) -> Result<Option<String>, String> {
+        Ok(self.0.get(key))
+    }
+
+    async fn set(&self, key: &str, value: &str) -> Result<(), String> {
+        self.0.set(key, value).map_err(|e| e.0)
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), String> {
+        self.0.forget(key);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn the_keychain_stores_for_the_native_client() {
+        use ruchoir_native::Storage;
+        let keychain = Keychain::with(Box::new(MemoryVault::default()));
+        assert!(!keychain.persistent());
+        assert_eq!(keychain.get("ruchoir.k").await, Ok(None));
+        keychain.set("ruchoir.k", "v").await.unwrap();
+        assert_eq!(keychain.get("ruchoir.k").await, Ok(Some("v".into())));
+        keychain.delete("ruchoir.k").await.unwrap();
+        assert_eq!(keychain.get("ruchoir.k").await, Ok(None));
+    }
 
     #[test]
     fn memory_vault_keeps_and_forgets() {

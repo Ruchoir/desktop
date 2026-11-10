@@ -1,43 +1,14 @@
-//! Rules shared by the downloads and the file windows: which links are the app's own, what a file
-//! name may contain, and the stable label of a viewer window.
+//! Local copies of drive files: what a file name may contain, where a copy is kept, how a save is
+//! told apart from an editor's intermediate writes, and the two drive routes they use (decision 9 of
+//! the shells' plan): `GET /api/v1/files/{id}/download` for the bytes and
+//! `POST /api/v1/files/{id}/versions` for a modified copy, both with the drive access token.
 //!
-//! Kept free of Tauri so they are tested on any machine. A viewer window is keyed by the path it
-//! shows, so opening the same file twice brings the first window forward instead of piling up copies.
+//! Kept free of Tauri so they are tested on any machine.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use sha2::{Digest, Sha256};
-
-/// The path and query of a link of the app's own origin (or a relative one); `None` for any other.
-/// `scheme` is the custom protocol's name; Windows spells that origin as `http://<scheme>.localhost`.
-pub fn own_path(href: &str, scheme: &str) -> Option<String> {
-    let path = own_path_unchecked(href, scheme)?;
-    // A path that starts with two slashes (or a slash and a backslash, which the URL parser reads
-    // the same way) is host-relative once joined to the app's origin: it would name another site.
-    if !path.starts_with('/') || path.starts_with("//") || path.contains('\\') {
-        return None;
-    }
-    Some(path)
-}
-
-fn own_path_unchecked(href: &str, scheme: &str) -> Option<String> {
-    if href.starts_with('/') {
-        return Some(href.to_owned());
-    }
-    let url = url::Url::parse(href).ok()?;
-    let own = match url.scheme() {
-        "http" => url.host_str() == Some(&format!("{scheme}.localhost")),
-        s => s == scheme && url.host_str() == Some("localhost"),
-    };
-    if !own {
-        return None;
-    }
-    Some(match url.query() {
-        Some(query) => format!("{}?{query}", url.path()),
-        None => url.path().to_owned(),
-    })
-}
 
 /// The longest file name kept: 150 characters, and 200 bytes of UTF-8 (file systems such as ext4
 /// cap a name at 255 bytes, and an accented name takes more bytes than characters).
@@ -118,39 +89,6 @@ pub fn window_title(title: &str) -> String {
         return format!("{}...", cut.trim_end());
     }
     cleaned.to_owned()
-}
-
-/// Whether `path` (path and query) is the bytes of a file: its preview, or the converted document
-/// the viewer shows for an office file, of an instance. Only those open in a file window: they are
-/// the paths the API serves with a script-less policy, and nothing else of the API belongs in a
-/// window of its own.
-pub fn is_file_bytes_path(path: &str) -> bool {
-    let path = path.split_once('?').map_or(path, |(p, _)| p);
-    let parts: Vec<&str> = path.split('/').collect();
-    // "", "i", <instance>, "api", "v1", "files", <uuid>, <kind>
-    let [_, "i", instance, "api", "v1", "files", id, kind] = parts[..] else {
-        return false;
-    };
-    let uuid = id.len() == 36
-        && id.char_indices().all(|(i, c)| {
-            if matches!(i, 8 | 13 | 18 | 23) {
-                c == '-'
-            } else {
-                c.is_ascii_hexdigit()
-            }
-        });
-    if !uuid || instance.is_empty() || !instance.chars().all(|c| c.is_ascii_alphanumeric()) {
-        return false;
-    }
-    matches!(kind, "preview" | "document")
-}
-
-/// The label of the window showing `path`: `viewer-` and the first 16 hex characters of its sha256
-/// (a path holds characters a label does not allow, and the hash is the same each time).
-pub fn window_label(path: &str) -> String {
-    let digest = Sha256::digest(path.as_bytes());
-    let hex: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
-    format!("viewer-{hex}")
 }
 
 /// How often a watched file's modification time is looked at.
@@ -267,31 +205,6 @@ fn settle(w: &mut Watched, hash: [u8; 32], first_seen: Instant, now: Instant) ->
     } else {
         Seen::Settling
     }
-}
-
-/// Whether `path` (path and query) is a link to the bytes of `file_id` on `instance`, the only kind
-/// `file_open_local` accepts, so that the bytes, the instance they come from and the file the copy
-/// is later sent to cannot disagree. `open_instance` is the instance on screen, which a path
-/// without an instance prefix means.
-pub fn is_link_to_file(
-    path: &str,
-    open_instance: Option<&str>,
-    instance: &str,
-    file_id: &str,
-) -> bool {
-    use crate::proxy::{route, Route};
-    let bare = path.split_once('?').map_or(path, |(p, _)| p);
-    let rest = match route(bare) {
-        Route::Api { instance: i, rest } if i == instance => rest,
-        Route::OpenApi(rest) if open_instance == Some(instance) => rest,
-        _ => return false,
-    };
-    let parts: Vec<&str> = rest.split('/').collect();
-    // "", "api", "v1", "files", <id>, <kind>
-    let [_, "api", "v1", "files", id, kind] = parts[..] else {
-        return false;
-    };
-    id == file_id && is_id(id) && matches!(kind, "download" | "preview" | "document")
 }
 
 /// Extensions the system would run rather than show: a file of one of these types is never opened
@@ -555,56 +468,116 @@ pub fn multipart_file(boundary: &str, name: &str, bytes: &[u8]) -> Vec<u8> {
     body
 }
 
+/// Why a drive request failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DriveError {
+    /// The drive refused the token (401): ask for a fresh one, or sign in again.
+    SignedOut,
+    /// Not allowed to read or change the file (403).
+    Forbidden,
+    /// The file exceeds the drive's upload limit (413).
+    TooLarge,
+    /// The drive could not be reached.
+    Unreachable,
+    /// Any other answer.
+    Failed(u16),
+}
+
+impl DriveError {
+    fn of(status: u16) -> Self {
+        match status {
+            401 => DriveError::SignedOut,
+            403 => DriveError::Forbidden,
+            413 => DriveError::TooLarge,
+            502..=504 => DriveError::Unreachable,
+            other => DriveError::Failed(other),
+        }
+    }
+
+    /// The code the interface translates.
+    pub fn code(&self) -> &'static str {
+        match self {
+            DriveError::SignedOut => "signed_out",
+            DriveError::Forbidden => "forbidden",
+            DriveError::TooLarge => "too_large",
+            DriveError::Unreachable => "unreachable",
+            DriveError::Failed(_) => "failed",
+        }
+    }
+}
+
+/// The bytes of a file's current version: `GET {drive}/api/v1/files/{id}/download`.
+pub async fn download(
+    http: &reqwest::Client,
+    drive: &str,
+    token: &str,
+    file_id: &str,
+) -> Result<Vec<u8>, DriveError> {
+    if !is_id(file_id) {
+        return Err(DriveError::Failed(400));
+    }
+    let answer = http
+        .get(format!("{drive}/api/v1/files/{file_id}/download"))
+        .bearer_auth(token)
+        .timeout(TRANSFER_WITHIN)
+        .send()
+        .await
+        .map_err(|_| DriveError::Unreachable)?;
+    if !answer.status().is_success() {
+        return Err(DriveError::of(answer.status().as_u16()));
+    }
+    answer
+        .bytes()
+        .await
+        .map(|b| b.to_vec())
+        .map_err(|_| DriveError::Unreachable)
+}
+
+/// How long a download or an upload may take.
+pub const TRANSFER_WITHIN: Duration = Duration::from_secs(10 * 60);
+
+/// Send `bytes` as a new version of `file_id`: `POST {drive}/api/v1/files/{id}/versions`, one
+/// `file` part. Answers the new current version's id, when the drive names it.
+pub async fn send_version(
+    http: &reqwest::Client,
+    drive: &str,
+    token: &str,
+    file_id: &str,
+    name: &str,
+    bytes: &[u8],
+) -> Result<Option<String>, DriveError> {
+    if !is_id(file_id) {
+        return Err(DriveError::Failed(400));
+    }
+    let mut random = [0u8; 12];
+    getrandom::fill(&mut random).map_err(|_| DriveError::Failed(0))?;
+    let boundary: String = random.iter().map(|b| format!("{b:02x}")).collect();
+    let boundary = format!("ruchoir{boundary}");
+    let answer = http
+        .post(format!("{drive}/api/v1/files/{file_id}/versions"))
+        .bearer_auth(token)
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(multipart_file(&boundary, name, bytes))
+        .timeout(TRANSFER_WITHIN)
+        .send()
+        .await
+        .map_err(|_| DriveError::Unreachable)?;
+    if !answer.status().is_success() {
+        return Err(DriveError::of(answer.status().as_u16()));
+    }
+    let body: serde_json::Value = answer.json().await.unwrap_or_default();
+    Ok(body
+        .get("version_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const SCHEME: &str = "ruchoir-app";
-
-    #[test]
-    fn only_the_apps_own_links_are_fetched() {
-        assert_eq!(
-            own_path("/api/v1/files/a/download", SCHEME).as_deref(),
-            Some("/api/v1/files/a/download")
-        );
-        assert_eq!(
-            own_path(
-                "ruchoir-app://localhost/i/x/api/v1/calendar/print?view=week",
-                SCHEME
-            )
-            .as_deref(),
-            Some("/i/x/api/v1/calendar/print?view=week")
-        );
-        assert_eq!(
-            own_path("http://ruchoir-app.localhost/api/v1/files/a", SCHEME).as_deref(),
-            Some("/api/v1/files/a")
-        );
-        assert_eq!(own_path("https://example.org/api/v1/files/a", SCHEME), None);
-        assert_eq!(own_path("//example.org/api/v1/files/a", SCHEME), None);
-        assert_eq!(
-            own_path("http://ruchoir-app.localhost.evil.org/x", SCHEME),
-            None
-        );
-    }
-
-    #[test]
-    fn a_link_never_escapes_the_apps_origin() {
-        for href in [
-            "//evil.org/x",
-            "/\\evil.org/x",
-            "\\evil.org/x",
-            "ruchoir-app://localhost//evil.org/x",
-            "http://ruchoir-app.localhost//evil.org/x",
-            "/a\\b",
-            "ruchoir-app://localhost/a%5Cb\\c",
-        ] {
-            assert_eq!(own_path(href, SCHEME), None, "{href}");
-        }
-        assert_eq!(
-            own_path("/i/x/files/a?name=b%20c&d=1", SCHEME).as_deref(),
-            Some("/i/x/files/a?name=b%20c&d=1")
-        );
-    }
 
     #[test]
     fn a_title_is_cleaned_not_renamed() {
@@ -655,42 +628,6 @@ mod tests {
         assert!(!cut.contains(" ."), "{cut}");
         let no_ext = safe_name(&"a".repeat(300));
         assert_eq!(no_ext.chars().count(), 150);
-    }
-
-    #[test]
-    fn a_window_label_is_stable_per_path() {
-        let a = window_label("/i/x/api/v1/files/a/content");
-        assert_eq!(a, window_label("/i/x/api/v1/files/a/content"));
-        assert_ne!(a, window_label("/i/x/api/v1/files/b/content"));
-        assert!(a.starts_with("viewer-"));
-        assert_eq!(a.len(), "viewer-".len() + 16);
-        assert!(a["viewer-".len()..].chars().all(|c| c.is_ascii_hexdigit()));
-    }
-
-    #[test]
-    fn only_file_bytes_open_in_a_window() {
-        let id = "0b9d9c5e-5e1a-4267-85f4-bfcec5b0bd3b";
-        for ok in [
-            format!("/i/57268a15/api/v1/files/{id}/preview"),
-            format!("/i/57268a15/api/v1/files/{id}/document?v=2026-11-03T10%3A00%3A00Z"),
-            format!("/i/57268a15/api/v1/files/{id}/preview?x=1"),
-        ] {
-            assert!(is_file_bytes_path(&ok), "{ok}");
-        }
-        for bad in [
-            "/".to_owned(),
-            "/api/v1/files/x/preview".to_owned(),
-            format!("/i/57268a15/api/v1/files/{id}/download"),
-            format!("/i/57268a15/api/v1/files/{id}/preview/x"),
-            format!("/i/57268a15/api/v1/files/{id}"),
-            "/i/57268a15/api/v1/files/not-a-uuid/preview".to_owned(),
-            "/i/57268a15/api/v1/me".to_owned(),
-            format!("/i/../api/v1/files/{id}/preview"),
-            format!("/i/57268a15/api/v1/files/{id}/preview/../../me"),
-            "/i/57268a15/emoji/a.svg".to_owned(),
-        ] {
-            assert!(!is_file_bytes_path(&bad), "{bad}");
-        }
     }
 
     fn id() -> String {
@@ -946,34 +883,6 @@ mod tests {
             sweep_old_copies(&dir.path().join("none"), SystemTime::now(), day),
             0
         );
-    }
-
-    #[test]
-    fn only_the_files_own_bytes_link_matches() {
-        let id = "0b1f6a52-3c4d-4e5f-8a9b-0c1d2e3f4a5b";
-        let other = "1b1f6a52-3c4d-4e5f-8a9b-0c1d2e3f4a5b";
-        let mine = format!("/i/a1/api/v1/files/{id}/download");
-        assert!(is_link_to_file(&mine, None, "a1", id));
-        assert!(is_link_to_file(&format!("{mine}?x=1"), None, "a1", id));
-        assert!(!is_link_to_file(&mine, None, "b2", id));
-        assert!(!is_link_to_file(&mine, None, "a1", other));
-        let bare = format!("/api/v1/files/{id}/download");
-        assert!(is_link_to_file(&bare, Some("a1"), "a1", id));
-        assert!(!is_link_to_file(&bare, Some("b2"), "a1", id));
-        assert!(!is_link_to_file(&bare, None, "a1", id));
-        assert!(!is_link_to_file(
-            &format!("/api/v1/files/{id}/versions"),
-            Some("a1"),
-            "a1",
-            id
-        ));
-        assert!(!is_link_to_file(
-            &format!("/api/v1/files/{id}/download/x"),
-            Some("a1"),
-            "a1",
-            id
-        ));
-        assert!(!is_link_to_file("/emoji/x", Some("a1"), "a1", id));
     }
 
     #[test]

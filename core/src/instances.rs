@@ -1,14 +1,16 @@
 //! The instances the person added, kept in a small JSON file of the app's data directory.
 //!
-//! Nothing secret lives here: the session tokens are in the system's keychain (`vault.rs`), one entry
-//! per instance id. The list holds what the interface needs to show and reach an instance.
+//! An instance is what its hub's manifest describes (`/.well-known/ruchoir-manifest`, decision 2 of
+//! the shells' plan): its domain, Propolis's origin (the issuer of its tokens) and its installed
+//! products with their origins. Nothing secret lives here: the grants are in the system's keychain
+//! (`vault.rs`), filed by issuer by `ruchoir-native`.
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-/// Why an address typed by the person is not an instance origin.
+/// Why an address typed by the person is not an instance's domain.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OriginError {
+pub enum DomainError {
     Empty,
     NotHttps,
     HasPath,
@@ -16,83 +18,128 @@ pub enum OriginError {
     Invalid,
 }
 
-/// Turn what the person typed into `https://host[:port]`, lowercase, or say why it cannot be one.
-///
-/// A bare host gets `https://`; a trailing slash is dropped. Plain `http://` is refused (a session
-/// token must never travel in clear), and so is anything beyond the origin: a path, a query or
-/// credentials would mean the address is not the instance itself.
-pub fn normalise_origin(input: &str) -> Result<String, OriginError> {
-    normalise_origin_with(input, false)
+impl DomainError {
+    /// The code the interface translates.
+    pub fn code(&self) -> &'static str {
+        match self {
+            DomainError::Empty => "empty",
+            DomainError::NotHttps => "not_https",
+            DomainError::HasPath => "has_path",
+            DomainError::HasCredentials => "has_credentials",
+            DomainError::Invalid => "invalid",
+        }
+    }
 }
 
-/// `normalise_origin`, also accepting `http://` towards this machine itself (`127.0.0.1`,
-/// `localhost`) when `allow_loopback_http` is set: debug builds only, for a throwaway local instance
-/// in tests. A release build never reaches an instance in clear.
-pub fn normalise_origin_with(
-    input: &str,
-    allow_loopback_http: bool,
-) -> Result<String, OriginError> {
+/// What discovery is given for what the person typed: the bare domain (`example.org`, lowercase),
+/// whose manifest is at `https://hub.<domain>/.well-known/ruchoir-manifest`.
+///
+/// With `allow_loopback_http` (debug builds only), `http://127.0.0.1:<port>` or
+/// `http://localhost:<port>` names a stand-in hub on this machine and answers its manifest's full
+/// address. A release build never reaches an instance in clear.
+pub fn discovery_address(input: &str, allow_loopback_http: bool) -> Result<String, DomainError> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
-        return Err(OriginError::Empty);
+        return Err(DomainError::Empty);
     }
     let with_scheme = if trimmed.contains("://") {
         trimmed.to_string()
     } else {
         format!("https://{trimmed}")
     };
-    let url = url::Url::parse(&with_scheme).map_err(|_| OriginError::Invalid)?;
+    let url = url::Url::parse(&with_scheme).map_err(|_| DomainError::Invalid)?;
     let loopback = matches!(url.host_str(), Some("127.0.0.1" | "localhost"));
     let scheme = url.scheme();
-    if scheme != "https" && !(scheme == "http" && allow_loopback_http && loopback) {
-        return Err(OriginError::NotHttps);
+    let plain_loopback = scheme == "http" && allow_loopback_http && loopback;
+    if scheme != "https" && !plain_loopback {
+        return Err(DomainError::NotHttps);
     }
     if !url.username().is_empty() || url.password().is_some() {
-        return Err(OriginError::HasCredentials);
+        return Err(DomainError::HasCredentials);
     }
     if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
-        return Err(OriginError::HasPath);
+        return Err(DomainError::HasPath);
     }
-    let host = url.host_str().ok_or(OriginError::Invalid)?;
-    Ok(match url.port() {
-        Some(port) => format!("{scheme}://{host}:{port}"),
-        None => format!("{scheme}://{host}"),
+    let host = url.host_str().ok_or(DomainError::Invalid)?;
+    let host = match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    };
+    Ok(if plain_loopback {
+        format!("http://{host}/.well-known/ruchoir-manifest")
+    } else {
+        host
     })
 }
 
-/// The instance's name as the rail shows it: its origin without the scheme (`example.org:8443`).
-pub fn origin_host(origin: &str) -> &str {
-    origin
-        .strip_prefix("https://")
-        .or_else(|| origin.strip_prefix("http://"))
-        .unwrap_or(origin)
-}
-
-/// Why an instance could not be added.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AddError {
-    /// The origin is already in the list, under this id.
-    AlreadyThere(String),
+/// A product of an instance, as its manifest lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstalledProduct {
+    /// `hub`, `drive`, `calendar`, `chat`...
+    pub name: String,
+    /// Its origin (`https://drive.example.org`), also the `resource` of its access tokens.
+    pub url: String,
 }
 
 /// One instance the person added.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Instance {
-    /// Random, chosen by the app: it names the keychain entry and the `/i/<id>` path.
+    /// Random, chosen by the app: it names the folder of the instance's local copies.
     pub id: String,
-    /// `https://host[:port]`, as `normalise_origin` writes it.
-    pub origin: String,
-    /// The instance's own name, from `GET /api/v1/instance`.
-    pub name: String,
+    /// The domain its manifest gives (`example.org`).
+    pub domain: String,
+    /// Propolis's origin, the issuer of the instance's tokens.
+    pub issuer: String,
+    /// The installed products, Propolis excepted, in the manifest's order.
+    pub products: Vec<InstalledProduct>,
     /// Seconds since the Unix epoch.
     pub added_at: i64,
 }
 
-/// Every instance added, and which one the interface shows.
+impl Instance {
+    /// The origin of the product named `name`, when it is installed.
+    pub fn product(&self, name: &str) -> Option<&str> {
+        self.products
+            .iter()
+            .find(|p| p.name == name)
+            .map(|p| p.url.as_str())
+    }
+
+    /// Every origin of the instance: Propolis and the products. A product's window may go to any of
+    /// them (its sign-in passes through Propolis); anything else opens in the system browser.
+    pub fn origins(&self) -> Vec<String> {
+        std::iter::once(self.issuer.clone())
+            .chain(self.products.iter().map(|p| p.url.clone()))
+            .collect()
+    }
+}
+
+impl From<&ruchoir_native::Instance> for Instance {
+    fn from(found: &ruchoir_native::Instance) -> Self {
+        Instance {
+            id: random_hex(16),
+            domain: found.domain.clone(),
+            issuer: found.issuer.clone(),
+            products: found
+                .products
+                .iter()
+                .map(|p| InstalledProduct {
+                    name: p.name.clone(),
+                    url: p.url.clone(),
+                })
+                .collect(),
+            added_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or_default(),
+        }
+    }
+}
+
+/// Every instance added.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstanceList {
     pub instances: Vec<Instance>,
-    pub active: Option<String>,
 }
 
 impl InstanceList {
@@ -115,57 +162,31 @@ impl InstanceList {
         std::fs::rename(tmp, path)
     }
 
-    /// Add an instance at the end of the list and open it. An origin already in the list is
-    /// refused with the id it has.
-    pub fn add(&mut self, origin: String, name: String) -> Result<Instance, AddError> {
-        if let Some(known) = self.instances.iter().find(|i| i.origin == origin) {
-            return Err(AddError::AlreadyThere(known.id.clone()));
+    /// Add an instance at the end of the list. One already there (same domain) keeps its id and
+    /// takes the newly discovered issuer and products, so adding it again refreshes it.
+    pub fn add(&mut self, instance: Instance) -> Instance {
+        if let Some(known) = self
+            .instances
+            .iter_mut()
+            .find(|i| i.domain == instance.domain)
+        {
+            known.issuer = instance.issuer;
+            known.products = instance.products;
+            return known.clone();
         }
-        let instance = Instance {
-            id: random_id(),
-            origin,
-            name,
-            added_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or_default(),
-        };
         self.instances.push(instance.clone());
-        self.active = Some(instance.id.clone());
-        Ok(instance)
+        instance
     }
 
-    /// Forget an instance. When it was the open one, the next in the list opens (or the one before
-    /// it, for the last), so the app keeps showing something while any instance is left.
-    pub fn remove(&mut self, id: &str) {
-        let Some(index) = self.instances.iter().position(|i| i.id == id) else {
-            return;
-        };
-        self.instances.remove(index);
-        if self.active.as_deref() == Some(id) {
-            let next = index.min(self.instances.len().saturating_sub(1));
-            self.active = self.instances.get(next).map(|i| i.id.clone());
-        }
-    }
-
-    /// The instance the interface shows.
-    pub fn active(&self) -> Option<&Instance> {
-        let id = self.active.as_deref()?;
-        self.instances.iter().find(|i| i.id == id)
+    /// Forget an instance.
+    pub fn remove(&mut self, id: &str) -> Option<Instance> {
+        let index = self.instances.iter().position(|i| i.id == id)?;
+        Some(self.instances.remove(index))
     }
 
     /// An instance by id.
     pub fn get(&self, id: &str) -> Option<&Instance> {
         self.instances.iter().find(|i| i.id == id)
-    }
-
-    /// Open another instance; false when the id is unknown.
-    pub fn open(&mut self, id: &str) -> bool {
-        if self.get(id).is_none() {
-            return false;
-        }
-        self.active = Some(id.to_string());
-        true
     }
 }
 
@@ -176,124 +197,69 @@ pub fn random_hex(bytes: usize) -> String {
     buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn random_id() -> String {
-    random_hex(16)
-}
-
-/// Why an address answering HTTPS is not an instance the app can use.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CheckError {
-    /// Nothing answered in time (down, wrong address, or a server that never replies).
-    Unreachable,
-    /// Something answered, but not a Ruchoir instance.
-    NotRuchoir,
-    /// A Ruchoir instance too old to give an app its own session.
-    Outdated,
-}
-
-/// How long the whole check may take before the app says the address cannot be reached.
-pub const CHECK_WITHIN: std::time::Duration = std::time::Duration::from_secs(15);
-
-/// Ask `GET /api/v1/instance` whether `origin` is a Ruchoir instance with native sessions, within
-/// `within` for the whole exchange (connection, answer and body), so a server that accepts the
-/// request and never replies does not leave the person waiting.
-pub async fn check_instance(
-    http: &reqwest::Client,
-    origin: &str,
-    within: std::time::Duration,
-) -> Result<(), CheckError> {
-    let ask = async {
-        let answer = http
-            .get(format!("{origin}/api/v1/instance"))
-            .send()
-            .await
-            .map_err(|_| CheckError::Unreachable)?;
-        answer
-            .json::<serde_json::Value>()
-            .await
-            .map_err(|_| CheckError::NotRuchoir)
-    };
-    let body = tokio::time::timeout(within, ask)
-        .await
-        .map_err(|_| CheckError::Unreachable)??;
-    match body.get("native_sessions").and_then(|v| v.as_bool()) {
-        Some(true) => Ok(()),
-        Some(false) => Err(CheckError::Outdated),
-        // An instance from before native sessions still announces its upload limit.
-        None if body.get("upload_max_bytes").is_some() => Err(CheckError::Outdated),
-        None => Err(CheckError::NotRuchoir),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn origin_host_drops_either_scheme() {
-        assert_eq!(origin_host("https://example.org:8443"), "example.org:8443");
-        assert_eq!(origin_host("http://localhost:18090"), "localhost:18090");
+    fn a_domain_is_bare_and_lowercase() {
+        assert_eq!(
+            discovery_address("example.org", false).unwrap(),
+            "example.org"
+        );
+        assert_eq!(
+            discovery_address(" HTTPS://Example.org/ ", false).unwrap(),
+            "example.org"
+        );
+        assert_eq!(
+            discovery_address("example.org:8443", false).unwrap(),
+            "example.org:8443"
+        );
+        for (input, error) in [
+            ("", DomainError::Empty),
+            ("http://example.org", DomainError::NotHttps),
+            ("example.org/app", DomainError::HasPath),
+            ("https://example.org/?a=1", DomainError::HasPath),
+            ("https://u:p@example.org", DomainError::HasCredentials),
+            ("https://", DomainError::Invalid),
+        ] {
+            assert_eq!(discovery_address(input, false), Err(error), "{input}");
+        }
     }
 
     #[test]
     fn loopback_http_only_when_allowed() {
         assert_eq!(
-            normalise_origin_with("http://127.0.0.1:18090", true).unwrap(),
-            "http://127.0.0.1:18090"
+            discovery_address("http://127.0.0.1:18090", true).unwrap(),
+            "http://127.0.0.1:18090/.well-known/ruchoir-manifest"
         );
         assert_eq!(
-            normalise_origin_with("http://localhost:3000/", true).unwrap(),
-            "http://localhost:3000"
+            discovery_address("http://127.0.0.1:18090", false),
+            Err(DomainError::NotHttps)
         );
-        assert!(matches!(
-            normalise_origin_with("http://example.org", true),
-            Err(OriginError::NotHttps)
-        ));
-        assert!(matches!(
-            normalise_origin_with("http://127.0.0.1:18090", false),
-            Err(OriginError::NotHttps)
-        ));
-        assert!(matches!(
-            normalise_origin("http://localhost:3000"),
-            Err(OriginError::NotHttps)
-        ));
+        assert_eq!(
+            discovery_address("http://example.org", true),
+            Err(DomainError::NotHttps)
+        );
     }
 
-    #[test]
-    fn normalise_origin_cases() {
-        assert_eq!(
-            normalise_origin("example.org").unwrap(),
-            "https://example.org"
-        );
-        assert_eq!(
-            normalise_origin(" HTTPS://Example.org/ ").unwrap(),
-            "https://example.org"
-        );
-        assert_eq!(
-            normalise_origin("https://example.org:8443").unwrap(),
-            "https://example.org:8443"
-        );
-        assert!(matches!(
-            normalise_origin("http://example.org"),
-            Err(OriginError::NotHttps)
-        ));
-        assert!(matches!(
-            normalise_origin("https://example.org/app"),
-            Err(OriginError::HasPath)
-        ));
-        assert!(matches!(
-            normalise_origin("https://example.org/?a=1"),
-            Err(OriginError::HasPath)
-        ));
-        assert!(matches!(
-            normalise_origin("https://u:p@example.org"),
-            Err(OriginError::HasCredentials)
-        ));
-        assert!(matches!(normalise_origin(""), Err(OriginError::Empty)));
-        assert!(matches!(
-            normalise_origin("https://"),
-            Err(OriginError::Invalid)
-        ));
+    fn instance(domain: &str) -> Instance {
+        Instance {
+            id: random_hex(16),
+            domain: domain.into(),
+            issuer: format!("https://auth.{domain}"),
+            products: vec![
+                InstalledProduct {
+                    name: "hub".into(),
+                    url: format!("https://hub.{domain}"),
+                },
+                InstalledProduct {
+                    name: "drive".into(),
+                    url: format!("https://drive.{domain}"),
+                },
+            ],
+            added_at: 0,
+        }
     }
 
     #[test]
@@ -301,17 +267,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("instances.json");
         let mut list = InstanceList::default();
-        let added = list
-            .add("https://a.example".into(), "Atelier".into())
-            .unwrap();
+        let added = list.add(instance("a.example"));
         assert_eq!(added.id.len(), 32);
-        assert_eq!(
-            list.active().map(|i| i.id.as_str()),
-            Some(added.id.as_str())
-        );
         list.save(&path).unwrap();
-        let loaded = InstanceList::load(&path);
-        assert_eq!(loaded, list);
+        assert_eq!(InstanceList::load(&path), list);
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains("token"));
     }
@@ -328,50 +287,34 @@ mod tests {
         assert_eq!(InstanceList::load(&broken), InstanceList::default());
     }
 
-    fn three() -> (InstanceList, Vec<Instance>) {
+    #[test]
+    fn adding_a_known_domain_refreshes_it_and_keeps_its_id() {
         let mut list = InstanceList::default();
-        let added = ["a", "b", "c"]
-            .iter()
-            .map(|h| {
-                list.add(format!("https://{h}.example"), h.to_string())
-                    .unwrap()
-            })
-            .collect();
-        (list, added)
+        let first = list.add(instance("a.example"));
+        let mut again = instance("a.example");
+        again.products.pop();
+        let refreshed = list.add(again);
+        assert_eq!(refreshed.id, first.id);
+        assert_eq!(list.instances.len(), 1);
+        assert_eq!(list.instances[0].products.len(), 1);
+        list.add(instance("b.example"));
+        assert_eq!(list.instances.len(), 2);
+        assert!(list.remove(&first.id).is_some());
+        assert!(list.get(&first.id).is_none());
     }
 
     #[test]
-    fn adding_appends_and_opens() {
-        let (list, added) = three();
-        assert_eq!(list.instances.len(), 3);
-        assert_eq!(list.instances[0].id, added[0].id);
-        assert_eq!(list.active().unwrap().id, added[2].id);
-    }
-
-    #[test]
-    fn the_same_origin_is_refused() {
-        let (mut list, added) = three();
-        let again = list.add("https://a.example".into(), "a".into());
-        assert_eq!(again, Err(AddError::AlreadyThere(added[0].id.clone())));
-        assert_eq!(list.instances.len(), 3);
-    }
-
-    #[test]
-    fn removing_the_open_one_opens_the_next() {
-        let (mut list, added) = three();
-        assert!(list.open(&added[1].id));
-        list.remove(&added[1].id);
-        assert_eq!(list.active().unwrap().id, added[2].id);
-        list.remove(&added[2].id);
-        assert_eq!(list.active().unwrap().id, added[0].id);
-        list.remove(&added[0].id);
-        assert!(list.active().is_none());
-    }
-
-    #[test]
-    fn opening_an_unknown_id_changes_nothing() {
-        let (mut list, added) = three();
-        assert!(!list.open("nope"));
-        assert_eq!(list.active().unwrap().id, added[2].id);
+    fn an_instance_names_its_products_and_origins() {
+        let i = instance("a.example");
+        assert_eq!(i.product("drive"), Some("https://drive.a.example"));
+        assert_eq!(i.product("chat"), None);
+        assert_eq!(
+            i.origins(),
+            [
+                "https://auth.a.example",
+                "https://hub.a.example",
+                "https://drive.a.example"
+            ]
+        );
     }
 }

@@ -1,117 +1,26 @@
 //! Ruchoir for Windows, macOS and Linux.
 //!
-//! The window loads the app's own protocol (`ruchoir-app://localhost/`, written
-//! `http://ruchoir-app.localhost/` on Windows), which serves the embedded web interface and, from
-//! later steps on, forwards each instance's API with its bearer (see `protocol.rs`). The logic that
-//! needs no window lives in `ruchoir-desktop-core`.
+//! The main window is a small launcher bundled with the app (`ui/`): the instances the person added
+//! and, for each, the products its manifest lists. Opening a product opens a window on the
+//! product's own host, signed in by the product's own session (`windows.rs`). The app itself keeps
+//! its tokens for what the pages do not do: the hub's live socket and notifications (`live.rs`) and
+//! the local copies of drive files (`files.rs`). The logic that needs no window lives in
+//! `ruchoir-desktop-core`.
 
 // No console window behind the app on Windows in release builds.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod diagnostics;
-mod downloads;
 mod files;
-mod notify;
-mod protocol;
-mod relay;
+mod live;
 mod shell;
 mod state;
-mod summaries;
 mod updater;
 mod usage;
+mod windows;
 
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
-use tauri_plugin_deep_link::DeepLinkExt;
-
-/// The scheme of the app's own origin.
-pub const APP_SCHEME: &str = "ruchoir-app";
-
-/// The address the window opens: the custom protocol as each system's webview spells it.
-pub(crate) fn app_url() -> tauri::Url {
-    let url = if cfg!(windows) {
-        "http://ruchoir-app.localhost/"
-    } else {
-        "ruchoir-app://localhost/"
-    };
-    url.parse().expect("a constant URL")
-}
-
-/// The origins whose pages the interface frames (the office editor's host). WebKit (Linux, macOS)
-/// hands a frame's navigation to the window's navigation handler too, so without this the editor's
-/// frame would be refused and sent to the system browser. The instance's API announces the host in
-/// the office session and the interface registers it here before mounting the frame. The cost: a
-/// top-level navigation to that one host would stay in the window; only the interface's own code can
-/// trigger one. Kept per instance, so removing or signing out one leaves the others' editors alone.
-#[derive(Default)]
-pub struct FrameOrigins(pub std::sync::Mutex<ruchoir_desktop_core::navigation::FrameList>);
-
-/// The editor is always the open instance's own, so its id is the open instance's (the interface
-/// has no other way to name it, and need not).
-#[tauri::command]
-fn allow_frame_origin(
-    origins: tauri::State<'_, FrameOrigins>,
-    desktop: tauri::State<'_, state::Desktop>,
-    origin: String,
-) -> Result<(), String> {
-    let key = ruchoir_desktop_core::navigation::frame_origin(&origin).ok_or("refused")?;
-    let instance = desktop.view().id.ok_or("refused")?;
-    origins
-        .0
-        .lock()
-        .map_err(|_| "refused".to_owned())?
-        .allow(&instance, key);
-    Ok(())
-}
-
-/// Whether the window may follow a navigation; a link to another site is opened outside instead.
-fn leave_for<R: tauri::Runtime>(app: &tauri::AppHandle<R>, url: &tauri::Url) -> bool {
-    use ruchoir_desktop_core::navigation::{navigation_allowing, Navigation};
-    use tauri::Manager;
-    use tauri_plugin_opener::OpenerExt;
-    let frames = app
-        .try_state::<FrameOrigins>()
-        .and_then(|o| o.0.lock().ok().map(|l| l.origins()))
-        .unwrap_or_default();
-    match navigation_allowing(url, &frames) {
-        Navigation::Stay => true,
-        Navigation::OpenOutside => {
-            let _ = app.opener().open_url(url.as_str(), None::<&str>);
-            false
-        }
-        Navigation::Refuse => false,
-    }
-}
-
-/// Whether a window may open a new window: never. A link asked to open one is sent outside when it
-/// leaves the app. Shared by the main window and the file windows.
-pub(crate) fn deny_new_window<R: tauri::Runtime>(
-    app: &tauri::AppHandle<R>,
-    url: &tauri::Url,
-) -> tauri::webview::NewWindowResponse<R> {
-    leave_for(app, url);
-    tauri::webview::NewWindowResponse::Deny
-}
-
-/// The interface hands its download links to the core (`downloads`); one that still reaches a
-/// webview goes the same way, "Save as", never to the webview. Shared by every window.
-pub(crate) fn route_download<R: tauri::Runtime>(
-    app: &tauri::AppHandle<R>,
-    event: tauri::webview::DownloadEvent<'_>,
-) -> bool {
-    if let tauri::webview::DownloadEvent::Requested { url, .. } = event {
-        let handle = app.clone();
-        let href = url.to_string();
-        let name = url
-            .path_segments()
-            .and_then(|mut segments| segments.next_back())
-            .unwrap_or("download")
-            .to_owned();
-        tauri::async_runtime::spawn(async move {
-            let _ = downloads::save(&handle, &href, &name).await;
-        });
-    }
-    false
-}
+use tauri_plugin_opener::OpenerExt;
 
 fn main() {
     // A small runtime: the app mostly waits on a few sockets (spec, "Lightness budget").
@@ -122,12 +31,11 @@ fn main() {
         .expect("the async runtime starts");
     tauri::async_runtime::set(runtime.handle().clone());
 
-    let builder = tauri::Builder::default()
+    tauri::Builder::default()
         // First, so a second launch is caught before anything else starts.
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             shell::show_window(app);
         }))
-        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
@@ -138,34 +46,22 @@ fn main() {
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec![shell::HIDDEN_ARG]),
-        ));
-
-    protocol::register(builder)
+        ))
         .invoke_handler(tauri::generate_handler![
-            allow_frame_origin,
-            state::instance_state,
-            state::instance_add,
-            state::sign_in_start,
-            state::sign_in_cancel,
             state::instances_state,
-            state::instance_open,
-            state::instance_remove,
+            state::instance_add,
+            state::instance_sign_in,
             state::instance_sign_out,
-            summaries::summaries,
-            notify::preferences_changed,
+            state::instance_remove,
+            state::product_open,
             shell::desktop_settings,
             shell::set_desktop_settings,
             shell::set_shell_labels,
             shell::app_quit,
-            relay::socket_send,
-            relay::socket_is_open,
-            downloads::download_save,
-            files::file_window,
             files::file_open_local,
             files::file_dismiss,
             files::file_send_version,
             files::file_keep_copy,
-            downloads::download_open,
             diagnostics::about_app,
             diagnostics::diagnostics,
             diagnostics::open_log_folder,
@@ -182,100 +78,40 @@ fn main() {
             let list_path = app.path().app_data_dir()?.join("instances.json");
             app.manage(state::Desktop::new(
                 list_path,
-                ruchoir_desktop_core::vault::open_vault(),
+                ruchoir_desktop_core::vault::Keychain::open(),
             ));
-            app.manage(FrameOrigins::default());
-            app.manage(relay::Relay::default());
-            app.manage(summaries::Summaries::default());
-            app.manage(notify::Notifier::default());
+            app.manage(live::Live::default());
             app.manage(shell::Shell::default());
             app.manage(files::Watcher::default());
-            app.manage(protocol::EmojiStore::default());
             app.manage(updater::Updates::default());
             updater::watch(app.handle());
-            notify::listen_for_clicks(app.handle());
+            live::listen_for_clicks(app.handle());
             files::start(app.handle());
-            relay::reconcile(app.handle());
+            live::reconcile(app.handle());
 
-            // `ruchoir://auth?code=...`, whether it launched the app or reached it running (the
-            // single-instance plugin hands a second launch's link over to this same handler).
-            // Registration needs `xdg-mime` and `update-desktop-database` on Linux, which a minimal
-            // system may lack: the app still works without it (links then do not reach it).
-            #[cfg(any(windows, target_os = "linux"))]
-            if let Err(error) = app.deep_link().register_all() {
-                log::warn!("the ruchoir:// links could not be registered: {error}");
-            }
-            let handle = app.handle().clone();
-            app.deep_link().on_open_url(move |event| {
-                for url in event.urls() {
-                    tauri::async_runtime::spawn(state::handle_deep_link(
-                        handle.clone(),
-                        url.to_string(),
-                    ));
-                }
-            });
-            if let Some(urls) = app.deep_link().get_current()? {
-                for url in urls {
-                    tauri::async_runtime::spawn(state::handle_deep_link(
-                        app.handle().clone(),
-                        url.to_string(),
-                    ));
-                }
-            }
-
+            let opener = app.handle().clone();
             let window =
-                WebviewWindowBuilder::new(app, "main", WebviewUrl::CustomProtocol(app_url()))
+                WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
                     .title("Ruchoir")
-                    .inner_size(1200.0, 800.0)
-                    .min_inner_size(360.0, 560.0)
-                    // Tauri's own drag-drop handler takes a file dropped on the window and reports its
-                    // path to the core; the page then never sees the drop. The composer and the files
-                    // list take drops themselves (`dataTransfer.files`), so the page gets them.
-                    .disable_drag_drop_handler()
-                    // The window shows Ruchoir only: other sites open in the system browser.
-                    .on_navigation({
-                        let handle = app.handle().clone();
-                        move |url| leave_for(&handle, url)
-                    })
-                    .on_new_window({
-                        let handle = app.handle().clone();
-                        move |url, _| deny_new_window(&handle, &url)
-                    })
-                    .on_download({
-                        let handle = app.handle().clone();
-                        move |_, event| route_download(&handle, event)
+                    .inner_size(420.0, 640.0)
+                    .min_inner_size(320.0, 420.0)
+                    // The launcher is the app's own page: a link out of it opens in the system browser.
+                    .on_navigation(move |url| {
+                        let own = matches!(url.scheme(), "tauri")
+                            || url.host_str() == Some("tauri.localhost")
+                            || url.host_str() == Some("localhost");
+                        if !own && matches!(url.scheme(), "http" | "https" | "mailto") {
+                            let _ = opener.opener().open_url(url.as_str(), None::<&str>);
+                        }
+                        own
                     });
-            // Frameless with the interface's own title bar on Windows and Linux; on macOS the
-            // system's traffic lights stay, drawn over the same bar.
-            #[cfg(target_os = "macos")]
-            let window = window
-                .title_bar_style(tauri::TitleBarStyle::Overlay)
-                .hidden_title(true);
-            #[cfg(not(target_os = "macos"))]
-            let window = window.decorations(false);
-            // Linux gives a frameless window square corners: a transparent window lets the
-            // interface draw rounded ones (`.wc-desktop--rounded`).
-            #[cfg(target_os = "linux")]
-            let window = window.transparent(true);
             // Launch at login starts the app in the tray.
             let hidden = std::env::args().any(|a| a == shell::HIDDEN_ARG);
             let window = window.visible(!hidden).build()?;
-            if hidden {
-                relay::set_paused(app.handle(), true);
-            }
             shell::build_tray(app.handle())?;
-            // A minimised or hidden window needs no live interface: pause the relay (spec,
-            // "Lightness"); closing hides to the tray when the settings say so.
+            // Closing hides to the tray when the settings say so.
             let handle = app.handle().clone();
-            let watched = window.clone();
-            window.on_window_event(move |event| {
-                if let tauri::WindowEvent::Resized(_) = event {
-                    let away = watched.is_minimized().unwrap_or(false)
-                        || !watched.is_visible().unwrap_or(true);
-                    relay::set_paused(&handle, away);
-                }
-                shell::on_window_event(&handle, event);
-            });
+            window.on_window_event(move |event| shell::on_window_event(&handle, event));
             Ok(())
         })
         .build(tauri::generate_context!())

@@ -1,0 +1,38 @@
+:root {
+  color-scheme: light dark;
+  --bg: #fbfaf7;
+  --fg: #1d1b16;
+  --muted: #6b665b;
+  --line: #e4e0d6;
+  --accent: #b7791f;
+  --error: #b42318;
+  font-family: system-ui, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1b1a17;
+    --fg: #f1eee6;
+    --muted: #a39e92;
+    --line: #34322c;
+    --accent: #e0a440;
+    --error: #f97066;
+  }
+}
+body { margin: 0; background: var(--bg); color: var(--fg); }
+main { max-width: 32rem; margin: 0 auto; padding: 1.5rem 1rem; }
+h1 { font-size: 1.25rem; margin: 0 0 1rem; }
+ul { list-style: none; margin: 0; padding: 0; }
+li.instance { border: 1px solid var(--line); border-radius: 0.5rem; padding: 0.75rem; margin-bottom: 0.75rem; }
+.head { display: flex; justify-content: space-between; align-items: baseline; gap: 0.5rem; }
+.domain { font-weight: 600; }
+.who, .note { color: var(--muted); font-size: 0.875rem; }
+.products { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.5rem; }
+button { font: inherit; border: 1px solid var(--line); background: transparent; color: inherit; border-radius: 0.375rem; padding: 0.375rem 0.75rem; cursor: pointer; }
+button.product { border-color: var(--accent); }
+button.link { border: none; padding: 0; color: var(--muted); text-decoration: underline; font-size: 0.875rem; }
+button:disabled { opacity: 0.5; cursor: default; }
+.actions { display: flex; gap: 0.75rem; margin-top: 0.5rem; }
+form { margin-top: 1.5rem; }
+.row { display: flex; gap: 0.5rem; margin-top: 0.25rem; }
+input { flex: 1; font: inherit; padding: 0.375rem 0.5rem; border: 1px solid var(--line); border-radius: 0.375rem; background: transparent; color: inherit; }
+.error { color: var(--error); font-size: 0.875rem; }

@@ -90,13 +90,9 @@ pub fn about_app<R: Runtime>(app: AppHandle<R>) -> About {
 #[tauri::command]
 pub async fn diagnostics<R: Runtime>(app: AppHandle<R>) -> String {
     let about = about(&app);
-    let views = app.state::<Desktop>().views();
-    let signed_in = views.iter().filter(|v| v.state == "signed_in").count();
-    let hosts: Vec<String> = views
-        .iter()
-        .filter_map(|v| v.origin.as_deref())
-        .map(|origin| origin.trim_start_matches("https://").to_owned())
-        .collect();
+    let views = app.state::<Desktop>().views().await;
+    let signed_in = views.iter().filter(|v| v.signed_in).count();
+    let hosts: Vec<String> = views.iter().map(|v| v.domain.clone()).collect();
     let log = match log_folder(&app).map(|dir| dir.join(format!("{LOG_NAME}.log"))) {
         Some(path) => tokio::fs::read_to_string(&path)
             .await
