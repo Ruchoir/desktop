@@ -3,9 +3,8 @@
 //!
 //! - Closing the window hides it (Windows and Linux: when "keep in the tray" is on, the default; macOS:
 //!   always, as a Mac app stays in the dock). The first time, a notification says where it went.
-//! - The relay to the interface pauses while the window is hidden, as while it is minimised.
 //! - Started with `--hidden` (launch at login does), no window shows until the tray is clicked.
-//! - The tray menu's words come from the interface's language (`set_shell_labels`); English before.
+//! - The tray menu's words come from the launcher's language (`set_shell_labels`); English before.
 
 use std::sync::Mutex;
 
@@ -250,14 +249,14 @@ pub fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
 
 /// Show the total of unread notifications on the app's icon and in the tray.
 pub fn update_badge<R: Runtime>(app: &AppHandle<R>) {
-    let total = crate::summaries::total_unread(app);
+    let total = app.state::<crate::live::Live>().total_unread();
     if let Some(window) = app.get_webview_window("main") {
         #[cfg(target_os = "macos")]
         let _ = window.set_badge_label((total > 0).then(|| total.to_string()));
         #[cfg(windows)]
         let _ = window.set_overlay_icon((total > 0).then(overlay_dot));
         #[cfg(all(unix, not(target_os = "macos")))]
-        let _ = window.set_badge_count((total > 0).then_some(i64::from(total)));
+        let _ = window.set_badge_count((total > 0).then_some(total));
     }
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
         let (plain, dot) = tray_images();
@@ -277,7 +276,6 @@ pub fn show_window<R: Runtime>(app: &AppHandle<R>) {
         let _ = window.unminimize();
         let _ = window.set_focus();
     }
-    crate::relay::set_paused(app, false);
 }
 
 /// What the close button does: hide the window to the tray when the settings say so.
@@ -293,7 +291,6 @@ pub fn on_window_event<R: Runtime>(app: &AppHandle<R>, event: &WindowEvent) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.hide();
     }
-    crate::relay::set_paused(app, true);
     if !settings.close_notice_seen && !cfg!(target_os = "macos") {
         let text = app
             .state::<Shell>()

@@ -1,16 +1,19 @@
-//! One realtime socket per signed-in instance, held by the app rather than by the interface.
+//! One live socket per signed-in instance, to its hub (`GET /api/v1/live/ws`), held by the app.
 //!
-//! It is what keeps an instance live when its spaces are not on screen (notifications and counts,
-//! from step 2), and for the instance on screen it is also the interface's socket: every frame is
-//! relayed to the webview, tagged with its instance, so there is never a second socket. The socket
-//! carries the bearer and no `Origin`, which the API accepts from a client that is not a browser.
+//! The hub settles who opens a socket on the upgrade request: a page brings a single-use ticket its
+//! product's backend got for it, an app its own access token for the hub, as a bearer and without
+//! `Origin`. The app is the second kind: it asks a token for each connection (a reconnection after an
+//! hour gets a fresh one) and never needs a ticket. The socket only receives; the app reacts to the
+//! hub's own frames (`hub.inbox.new`, `hub.inbox.read`) with notifications and the badge.
+
+use std::future::Future;
+use std::pin::Pin;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures_util::{SinkExt, StreamExt};
-use tokio::sync::mpsc;
+use futures_util::StreamExt;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
@@ -24,8 +27,31 @@ pub enum WatcherEvent {
     Message(String),
     /// The socket dropped; the watcher is already trying again.
     Closed,
-    /// The instance refused the session: the watcher has stopped for good.
+    /// The hub refused the token, or no token can be had any more: the watcher has stopped for good.
     SignedOut,
+}
+
+/// Why no token could be had for a connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenError {
+    /// The session ended: the person signs in again.
+    SignedOut,
+    /// Propolis could not be reached right now: try again later.
+    Unavailable,
+}
+
+/// What gives the watcher a hub access token for each connection.
+pub type Tokens =
+    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<String, TokenError>> + Send>> + Send + Sync>;
+
+/// The live socket's address for a hub origin.
+pub fn socket_url(hub: &str) -> String {
+    format!(
+        "{}/api/v1/live/ws",
+        hub.trim_end_matches('/')
+            .replacen("https://", "wss://", 1)
+            .replacen("http://", "ws://", 1)
+    )
 }
 
 /// The wait before reconnection attempt `attempt` (0 first): 1 s doubling up to 30 s, plus up to
@@ -38,96 +64,70 @@ pub fn backoff(attempt: u32) -> Duration {
     Duration::from_millis(base_ms + jitter)
 }
 
-/// The frames the interface may send up the socket: typing and pings, nothing else (every mutation
-/// goes through the API, and the socket accepts no other kind anyway).
-pub fn frame_allowed(frame: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(frame)
-        .ok()
-        .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_string))
-        .is_some_and(|kind| kind == "ping" || kind == "typing")
-}
-
 /// A running watcher. Dropping it does not stop it; `stop` does.
 pub struct Watcher {
-    outgoing: mpsc::UnboundedSender<String>,
     task: JoinHandle<()>,
     open: Arc<AtomicBool>,
 }
 
 impl Watcher {
-    /// Connect to `origin`'s realtime socket with `token`, and keep connecting until stopped or
-    /// signed out.
-    pub fn spawn<F>(origin: String, token: String, sink: F) -> Watcher
+    /// Connect to `hub`'s live socket with a token from `tokens`, and keep connecting until stopped
+    /// or signed out.
+    pub fn spawn<F>(hub: String, tokens: Tokens, sink: F) -> Watcher
     where
         F: Fn(WatcherEvent) + Send + Sync + 'static,
     {
-        let (outgoing, mut frames) = mpsc::unbounded_channel::<String>();
         let open = Arc::new(AtomicBool::new(false));
         let is_open = open.clone();
-        let url = format!(
-            "{}/api/v1/realtime/ws",
-            origin
-                .replacen("https://", "wss://", 1)
-                .replacen("http://", "ws://", 1)
-        );
+        let url = socket_url(&hub);
         let task = tokio::spawn(async move {
             let mut attempt = 0u32;
             loop {
-                let Ok(mut request) = url.as_str().into_client_request() else {
-                    return;
-                };
-                if let Ok(value) = format!("Bearer {token}").parse() {
-                    request.headers_mut().insert("authorization", value);
-                }
-                match tokio_tungstenite::connect_async(request).await {
-                    Ok((socket, _)) => {
-                        attempt = 0;
-                        is_open.store(true, Ordering::Relaxed);
-                        sink(WatcherEvent::Open);
-                        let (mut write, mut read) = socket.split();
-                        loop {
-                            tokio::select! {
-                                incoming = read.next() => match incoming {
-                                    Some(Ok(Message::Text(text))) => sink(WatcherEvent::Message(text.to_string())),
-                                    // Pings are answered by the library as they are read.
-                                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
-                                    Some(Ok(_)) => {}
-                                },
-                                frame = frames.recv() => match frame {
-                                    Some(frame) => {
-                                        if write.send(Message::Text(frame.into())).await.is_err() {
-                                            break;
-                                        }
-                                    }
-                                    None => return,
-                                },
-                            }
-                        }
-                        is_open.store(false, Ordering::Relaxed);
-                        sink(WatcherEvent::Closed);
-                    }
-                    Err(WsError::Http(response)) if response.status().as_u16() == 401 => {
+                let token = match tokens().await {
+                    Ok(token) => Some(token),
+                    Err(TokenError::SignedOut) => {
                         sink(WatcherEvent::SignedOut);
                         return;
                     }
-                    Err(_) => {}
+                    Err(TokenError::Unavailable) => None,
+                };
+                if let Some(token) = token {
+                    let Ok(mut request) = url.as_str().into_client_request() else {
+                        return;
+                    };
+                    if let Ok(value) = format!("Bearer {token}").parse() {
+                        request.headers_mut().insert("authorization", value);
+                    }
+                    match tokio_tungstenite::connect_async(request).await {
+                        Ok((mut socket, _)) => {
+                            attempt = 0;
+                            is_open.store(true, Ordering::Relaxed);
+                            sink(WatcherEvent::Open);
+                            loop {
+                                match socket.next().await {
+                                    Some(Ok(Message::Text(text))) => {
+                                        sink(WatcherEvent::Message(text.to_string()))
+                                    }
+                                    // Pings are answered by the library as they are read.
+                                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                                    Some(Ok(_)) => {}
+                                }
+                            }
+                            is_open.store(false, Ordering::Relaxed);
+                            sink(WatcherEvent::Closed);
+                        }
+                        Err(WsError::Http(response)) if response.status().as_u16() == 401 => {
+                            sink(WatcherEvent::SignedOut);
+                            return;
+                        }
+                        Err(_) => {}
+                    }
                 }
-                // Frames typed while the socket was down are dropped: they were ephemeral.
-                while frames.try_recv().is_ok() {}
                 tokio::time::sleep(backoff(attempt)).await;
                 attempt = attempt.saturating_add(1);
             }
         });
-        Watcher {
-            outgoing,
-            task,
-            open,
-        }
-    }
-
-    /// Send a frame up the socket, if it is open.
-    pub fn send(&self, frame: String) {
-        let _ = self.outgoing.send(frame);
+        Watcher { task, open }
     }
 
     /// Whether the socket is open right now.

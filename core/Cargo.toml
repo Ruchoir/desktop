@@ -1,6 +1,6 @@
 [package]
 name = "ruchoir-desktop-core"
-description = "The desktop app's logic that needs no window: instances, tokens, sign-in, proxy rules, realtime."
+description = "The desktop app's logic that needs no window: instances, sign-in, the hub's live socket and inbox, local copies of drive files."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -12,7 +12,13 @@ publish = false
 futures-util = "=0.3.34"
 getrandom = "=0.3.4"
 keyring = { version = "=3.6.3", features = ["apple-native", "windows-native", "async-secret-service", "tokio", "crypto-rust"] }
-reqwest = { version = "=0.12.28", default-features = false, features = ["json", "rustls-tls-native-roots", "stream", "gzip"] }
+# The inbox and the drive's routes (Sean McArthur and community, MIT/Apache-2.0), the version
+# `ruchoir-native` takes its client in, over rustls with the ring provider.
+reqwest = { version = "=0.13.5", default-features = false, features = ["rustls-no-provider", "http2", "json"] }
+# Discovery, sign-in and tokens with Propolis (Ruchoir/core, MPL-2.0), from its release tag.
+ruchoir-native = { git = "https://github.com/Ruchoir/core", tag = "v0.6.0" }
+# TLS (rustls project, ISRG Prossimo; MIT/Apache-2.0/ISC), to install the ring provider.
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "logging", "tls12"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 sha2 = "=0.10.9"
 serde_json = "=1.0.154"

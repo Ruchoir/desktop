@@ -1,85 +1,76 @@
-//! File windows. The viewer's "open in a new tab" has no tab to open in here, so the interface asks
-//! for a window of its own: a decorated one showing a file's bytes (its preview, or the converted
-//! document) on the app's protocol, which the webview renders as a browser tab would (a PDF, an
-//! image). Only those two paths are accepted. The window shows a file and no interface, and holds
-//! no capability, so no command can be called from it. What keeps a script in an SVG or HTML file
-//! from running there is the response's policy (the instance's own, or `INLINE_FILE_CSP` added by
-//! the core's proxy), not this window. It follows the main window's rules for navigation, new
-//! windows and downloads.
+//! Local copies of drive files (decision 9 of the shells' plan). A drive page asks the app to open a
+//! file with the computer's own app: the app reads its bytes from the drive with the drive access
+//! token, keeps a copy in its cache and opens it; when the person saves it, the drive window is
+//! offered to send it back, which goes up as a new version (`POST /api/v1/files/{id}/versions`).
+//!
+//! These commands are the only ones a drive window may call (`windows.rs`); the instance is the one
+//! of the calling window, never a parameter, so a page acts on its own instance's files only.
 
 use std::collections::HashSet;
 use std::sync::{Mutex, PoisonError};
 use std::time::{Instant, SystemTime};
 
 use ruchoir_desktop_core::files::{
-    forget_instance_copies, hash_bytes, hash_file, is_file_bytes_path, is_link_to_file,
-    is_unsafe_to_open, local_path, multipart_file, open_root, own_path, step, sweep_old_copies,
-    window_label, window_title, Seen, SessionEnd, Watched, Watches, LIFETIME, POLL,
+    download, forget_instance_copies, hash_bytes, hash_file, is_unsafe_to_open, local_path,
+    open_root, safe_name, send_version, step, sweep_old_copies, DriveError, Seen, SessionEnd,
+    Watched, Watches, LIFETIME, POLL,
 };
-use ruchoir_desktop_core::proxy;
 use serde::Serialize;
-use tauri::http::{header, HeaderMap, HeaderValue, Method};
-use tauri::{AppHandle, Emitter, Manager, Runtime, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, Emitter, Manager, Runtime, Webview};
+use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_opener::OpenerExt;
 
 use crate::state::Desktop;
 
-/// Open the app's own `href` in a window, or bring forward the one already showing it.
-#[tauri::command]
-pub async fn file_window<R: Runtime>(
-    app: AppHandle<R>,
-    href: String,
-    title: String,
-) -> Result<(), String> {
-    let path = own_path(&href, crate::APP_SCHEME).ok_or("refused")?;
-    // Only a file's bytes: nothing else of the API belongs in a window of its own.
-    if !is_file_bytes_path(&path) {
-        return Err("refused".into());
+/// The instance of a drive window calling a command.
+fn calling_instance<R: Runtime>(webview: &Webview<R>) -> Result<String, String> {
+    match crate::windows::parse_label(webview.label()) {
+        Some((instance, "drive")) => Ok(instance.to_owned()),
+        _ => Err("refused".into()),
     }
-    let label = window_label(&path);
-    if let Some(window) = app.get_webview_window(&label) {
-        let _ = window.show();
-        let _ = window.unminimize();
-        return window.set_focus().map_err(|_| "failed".to_owned());
+}
+
+/// A drive access token for the instance.
+async fn drive_token<R: Runtime>(app: &AppHandle<R>, instance: &str) -> Result<String, String> {
+    use ruchoir_native::NativeError;
+    match app.state::<Desktop>().token(instance, "drive").await {
+        Ok(token) => Ok(token),
+        Err(NativeError::SessionEnded | NativeError::SignedOut) => {
+            crate::state::session_expired(app, instance);
+            Err("signed_out".into())
+        }
+        Err(_) => Err("unreachable".into()),
     }
-    let base = crate::app_url();
-    let url = base.join(&path).map_err(|_| "refused")?;
-    // Belt and braces after `own_path`: the joined address must still be the app's own origin.
-    if url.scheme() != base.scheme()
-        || url.host_str() != base.host_str()
-        || url.port() != base.port()
-    {
-        return Err("refused".into());
-    }
-    // An async command, so the build runs off the main thread (a synchronous one can deadlock on Windows).
-    let built = WebviewWindowBuilder::new(&app, &label, WebviewUrl::CustomProtocol(url))
-        .title(window_title(&title))
-        .inner_size(1000.0, 760.0)
-        .decorations(true)
-        .on_navigation({
-            let handle = app.clone();
-            move |url| crate::leave_for(&handle, url)
-        })
-        .on_new_window({
-            let handle = app.clone();
-            move |url, _| crate::deny_new_window(&handle, &url)
-        })
-        .on_download({
-            let handle = app.clone();
-            move |_, event| crate::route_download(&handle, event)
-        })
-        .build();
-    match built {
-        Ok(_) => Ok(()),
-        // A second call for the same address won the race: show that window.
-        Err(_) => match app.get_webview_window(&label) {
-            Some(window) => {
-                let _ = window.show();
-                let _ = window.unminimize();
-                window.set_focus().map_err(|_| "failed".to_owned())
-            }
-            None => Err("failed".to_owned()),
-        },
+}
+
+/// The drive's origin for the instance.
+fn drive_origin<R: Runtime>(app: &AppHandle<R>, instance: &str) -> Result<String, String> {
+    app.state::<Desktop>()
+        .instance(instance)
+        .and_then(|i| i.product("drive").map(str::to_owned))
+        .ok_or_else(|| "refused".to_owned())
+}
+
+/// Ask where to save `name` with the system's "Save as" dialog; `None` when the person cancelled.
+async fn choose_save_path<R: Runtime>(
+    app: &AppHandle<R>,
+    name: &str,
+) -> Result<Option<std::path::PathBuf>, String> {
+    let name = safe_name(name);
+    let asking = app.clone();
+    // The dialog waits for the person: off the async workers, which keep the app's sockets.
+    let chosen = tauri::async_runtime::spawn_blocking(move || {
+        asking
+            .dialog()
+            .file()
+            .set_file_name(name)
+            .blocking_save_file()
+    })
+    .await
+    .map_err(|_| "failed")?;
+    match chosen {
+        Some(chosen) => Ok(Some(chosen.into_path().map_err(|_| "failed")?)),
+        None => Ok(None),
     }
 }
 
@@ -138,8 +129,10 @@ impl Drop for Sending<'_> {
     }
 }
 
+/// Tell the instance's drive window a copy was saved (`file:saved`).
 pub fn emit_saved<R: Runtime>(app: &AppHandle<R>, saved: &Saved) {
-    let _ = app.emit("file:saved", saved);
+    let label = crate::windows::label(&saved.instance, "drive");
+    let _ = app.emit_to(label.as_str(), "file:saved", saved);
 }
 
 fn open_folder<R: Runtime>(app: &AppHandle<R>) -> Result<std::path::PathBuf, String> {
@@ -151,17 +144,17 @@ fn open_folder<R: Runtime>(app: &AppHandle<R>) -> Result<std::path::PathBuf, Str
 /// Download a file to the cache, open it with the computer's app and, when `base_version` is given
 /// (the person may add a version), watch it for saves. The copy is replaced at each opening.
 /// A copy holding an unsent edit is opened as it is, not replaced. Errors: `unsafe_type` (a file
-/// the system would run), `refused` (a link that is not this file's bytes on this instance, or a
-/// bad id), `signed_out`, `unreachable`, `no_app` (nothing on the computer opens it), `failed`.
+/// the system would run), `refused` (not a drive window, or a bad id), `signed_out`, `forbidden`,
+/// `unreachable`, `no_app` (nothing on the computer opens it), `failed`.
 #[tauri::command]
 pub async fn file_open_local<R: Runtime>(
     app: AppHandle<R>,
-    instance: String,
+    webview: Webview<R>,
     file_id: String,
     name: String,
-    href: String,
     base_version: Option<String>,
 ) -> Result<(), String> {
+    let instance = calling_instance(&webview)?;
     // The name as given and as it will be kept (`safe_name` may cut it down to an executable one).
     if is_unsafe_to_open(&name) {
         return Err("unsafe_type".into());
@@ -175,19 +168,23 @@ pub async fn file_open_local<R: Runtime>(
     {
         return Err("unsafe_type".into());
     }
-    // The bytes, the instance they come from and the file the copy is later sent to must agree.
-    let own = own_path(&href, crate::APP_SCHEME).ok_or("refused")?;
-    let on_screen = app.state::<Desktop>().view().id;
-    if !is_link_to_file(&own, on_screen.as_deref(), &instance, &file_id) {
-        return Err("refused".into());
-    }
     let watcher = app.state::<Watcher>();
     // A copy holding an edit that was not sent is never overwritten: it is opened as it is, and
     // its watch stays.
     if has_unsent_edit(&watcher, &instance, &file_id).await {
         return open_copy(&app, &path);
     }
-    let bytes = crate::downloads::fetch(&app, &href).await?;
+    let drive = drive_origin(&app, &instance)?;
+    let token = drive_token(&app, &instance).await?;
+    let http = app.state::<Desktop>().http.clone();
+    let bytes = match download(&http, &drive, &token, &file_id).await {
+        Ok(bytes) => bytes,
+        Err(DriveError::SignedOut) => {
+            crate::state::session_expired(&app, &instance);
+            return Err("signed_out".into());
+        }
+        Err(error) => return Err(error.code().into()),
+    };
     // The watch first, with the new content's hash: rewriting the copy under an older watch would
     // let the poller read the new bytes as the person's edit.
     let watching = base_version.is_some();
@@ -271,13 +268,19 @@ async fn has_unsent_edit(watcher: &Watcher, instance: &str, file_id: &str) -> bo
 
 /// The person turned the offer down: the file is no longer watched (opening it again restarts it).
 #[tauri::command]
-pub fn file_dismiss(watcher: tauri::State<'_, Watcher>, instance: String, file_id: String) {
+pub fn file_dismiss<R: Runtime>(
+    webview: Webview<R>,
+    watcher: tauri::State<'_, Watcher>,
+    file_id: String,
+) -> Result<(), String> {
+    let instance = calling_instance(&webview)?;
     if let Ok(mut list) = watcher.watches.lock() {
         list.remove(&instance, &file_id);
     }
+    Ok(())
 }
 
-/// Send the saved copy as a new version of its file, with the instance's session. On success the
+/// Send the saved copy as a new version of its file, with the drive access token. On success the
 /// watch ends, unless a newer save is already waiting. Errors: `busy` (an upload of this file is
 /// running), `not_watched` (the watch ended or never began), `unchanged` (the copy equals the version
 /// it came from: nothing is uploaded), `signed_out` (the session is dropped, the copies stay),
@@ -285,9 +288,10 @@ pub fn file_dismiss(watcher: tauri::State<'_, Watcher>, instance: String, file_i
 #[tauri::command]
 pub async fn file_send_version<R: Runtime>(
     app: AppHandle<R>,
-    instance: String,
+    webview: Webview<R>,
     file_id: String,
 ) -> Result<(), String> {
+    let instance = calling_instance(&webview)?;
     let watcher = app.state::<Watcher>();
     let _slot = Sending::take(&watcher, &instance, &file_id).ok_or("busy")?;
     let (path, name) = {
@@ -307,39 +311,16 @@ pub async fn file_send_version<R: Runtime>(
     if same {
         return Err("unchanged".into());
     }
-    let desktop = app.state::<Desktop>();
-    let (origin, token) = desktop.credentials(&instance).ok_or("signed_out")?;
-    let token = token.ok_or("signed_out")?;
-    let mut random = [0u8; 12];
-    getrandom::fill(&mut random).map_err(|_| "failed")?;
-    let boundary: String = random.iter().map(|b| format!("{b:02x}")).collect();
-    let boundary = format!("ruchoir{boundary}");
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_str(&format!("multipart/form-data; boundary={boundary}"))
-            .map_err(|_| "failed")?,
-    );
-    let answer = proxy::forward(
-        &desktop.http,
-        Method::POST,
-        &format!("/api/v1/files/{file_id}/versions"),
-        &headers,
-        multipart_file(&boundary, &name, &bytes),
-        &origin,
-        Some(&token),
-    )
-    .await;
-    match answer.status {
-        200..=299 => {
+    let drive = drive_origin(&app, &instance)?;
+    let token = drive_token(&app, &instance).await?;
+    let http = app.state::<Desktop>().http.clone();
+    match send_version(&http, &drive, &token, &file_id, &name, &bytes).await {
+        Ok(sent) => {
             if let Ok(mut list) = watcher.watches.lock() {
                 if let Some(w) = list.find(&instance, &file_id) {
                     w.mark_sent(hash);
                     // The answer is the file with its new current version: the next check is made
                     // against that one, not the version the copy was opened from.
-                    let sent = serde_json::from_slice::<serde_json::Value>(&answer.body)
-                        .ok()
-                        .and_then(|v| v.get("version_id")?.as_str().map(str::to_owned));
                     if let Some(version) = sent {
                         w.base_version = version;
                     }
@@ -354,16 +335,13 @@ pub async fn file_send_version<R: Runtime>(
             }
             Ok(())
         }
-        401 => {
-            // The session is over: the rest of the app learns it as it does from any 401.
-            crate::notify::signed_out(&app, &instance);
+        Err(DriveError::SignedOut) => {
+            // The session is over: the copies stay, to be sent once signed in again.
+            crate::state::session_expired(&app, &instance);
             Err("signed_out".into())
         }
-        // Only the file's owner or a space admin may add a version: the server decides.
-        403 => Err("forbidden".into()),
-        413 => Err("too_large".into()),
-        502 => Err("unreachable".into()),
-        _ => Err("failed".into()),
+        // Only the people allowed to edit the file may add a version: the drive decides.
+        Err(error) => Err(error.code().into()),
     }
 }
 
@@ -371,16 +349,17 @@ pub async fn file_send_version<R: Runtime>(
 #[tauri::command]
 pub async fn file_keep_copy<R: Runtime>(
     app: AppHandle<R>,
-    instance: String,
+    webview: Webview<R>,
     file_id: String,
 ) -> Result<bool, String> {
+    let instance = calling_instance(&webview)?;
     let (path, name) = {
         let watcher = app.state::<Watcher>();
         let mut list = watcher.watches.lock().map_err(|_| "failed")?;
         let w = list.find(&instance, &file_id).ok_or("not_watched")?;
         (w.path.clone(), w.name.clone())
     };
-    let Some(target) = crate::downloads::choose_save_path(&app, &name).await? else {
+    let Some(target) = choose_save_path(&app, &name).await? else {
         return Ok(false);
     };
     tokio::fs::copy(&path, &target)
@@ -402,11 +381,11 @@ pub fn session_ended<R: Runtime>(app: &AppHandle<R>, instance: &str, end: Sessio
             list.forget_instance(instance);
         }
     }
-    crate::notify::forget_saves(app, instance);
     if let Ok(root) = open_folder(app) {
         forget_instance_copies(&root, instance);
     }
-    let _ = app.emit("file:forgotten", instance);
+    let label = crate::windows::label(instance, "drive");
+    let _ = app.emit_to(label.as_str(), "file:forgotten", instance);
 }
 
 /// The offer for a file that is still watched, or `None`.
@@ -501,7 +480,7 @@ async fn round<R: Runtime>(app: &AppHandle<R>) {
         if let Some(saved) = saved {
             // The notice only if the watch is still there (a sign-out may have come in between).
             if current_save(app, &saved.instance, &saved.file_id).is_some() {
-                crate::notify::announce_saved(app, &saved);
+                crate::live::announce_saved(app, &saved);
             }
         }
     }

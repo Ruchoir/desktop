@@ -7,10 +7,9 @@
   },
   "app": {
     "windows": [],
-    "withGlobalTauri": false,
+    "withGlobalTauri": true,
     "security": {
-      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' ipc: http://ipc.localhost; frame-src 'self' https:; font-src 'self'",
-      "devCsp": "default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' ipc: http://ipc.localhost ws://localhost:3112; frame-src 'self' https:; font-src 'self'"
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src ipc: http://ipc.localhost; font-src 'self'"
     }
   },
   "bundle": {
@@ -19,13 +18,12 @@
     "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"],
     "category": "Productivity",
     "shortDescription": "Ruchoir",
-    "longDescription": "Ruchoir for Windows, macOS and Linux: the spaces of every Ruchoir instance you belong to.",
+    "longDescription": "Ruchoir for Windows, macOS and Linux: the products of every Ruchoir instance you belong to.",
     "license": "AGPL-3.0-only",
     "linux": { "deb": { "depends": ["libwebkit2gtk-4.1-0", "xdg-utils", "desktop-file-utils"] } },
     "macOS": { "minimumSystemVersion": "12.0" }
   },
   "plugins": {
-    "deep-link": { "desktop": { "schemes": ["ruchoir"] } },
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEJGODkyNTg3QjNDREVGNzIKUldSeTc4MnpoeVdKdjlueE1uTHJqUVBwdzZhZlBpWlJaZm1JTklXTmk2emNVNzl6RXI3Z2FBTG0K",
       "endpoints": ["https://ruchoir.com/desktop/latest.json"],

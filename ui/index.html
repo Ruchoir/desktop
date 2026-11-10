@@ -4,10 +4,23 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Ruchoir</title>
+    <link rel="stylesheet" href="launcher.css" />
+    <script type="module" src="launcher.js"></script>
   </head>
   <body>
-    <!-- Placeholder bundled interface: the monolith's web export is no longer embedded here, and the
-         shell's own interface replaces this page when the shell is rebuilt. -->
-    <main>Ruchoir</main>
+    <main>
+      <h1 data-t="title"></h1>
+      <p id="keychain" class="note" hidden data-t="no_keychain"></p>
+      <ul id="instances"></ul>
+      <p id="empty" class="note" hidden data-t="empty"></p>
+      <form id="add">
+        <label for="domain" data-t="add_label"></label>
+        <div class="row">
+          <input id="domain" name="domain" autocomplete="off" spellcheck="false" placeholder="example.org" required />
+          <button type="submit" data-t="add"></button>
+        </div>
+        <p id="error" class="error" role="alert" hidden></p>
+      </form>
+    </main>
   </body>
 </html>

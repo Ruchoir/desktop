@@ -106,33 +106,41 @@ what is specific to this repository, and never contradicts this block.
 
 ## This repository
 
-The desktop app for Windows, macOS and Linux: a light Tauri shell with a bar of products on the
-left, one web view per product taking the whole space, and the option to open a product in its own
-window.
+The desktop app for Windows, macOS and Linux: a light Tauri shell. Its own window is a small
+launcher (the instances added, and each instance's installed products); opening a product opens a
+window on the product's own host (`https://drive.<domain>`...), signed in by the product's own
+browser session. The app keeps its own tokens only for what pages do not do: the hub's live socket
+and notifications, and the local copies of drive files.
 
-**Status:** `apps/desktop` of `Ruchoir/ruchoir` moved here with its history, as it was. The shell
-is not reworked yet: it is still the monolith's app, minus the monolith's web interface. Next: the
-shell rebuilt as described above, its product logic (opened copies of drive files, their watcher,
-the notifier) moved to the products or behind their APIs.
+**Status:** the shell is rebuilt on `ruchoir-native` (phase 6 of the restructuring, decisions 1, 2,
+3 and 9 of its plan): accounts by discovery from the hub's manifest and RFC 8252 sign-in with
+Propolis, the hub's live socket and inbox, drive versions for local copies. The monolith's proxy
+protocol and its token are gone. Not yet: a product rail in one window, the e2e run (`e2e/` still
+drives the monolith's flow).
 
 ### Layout
 
 - `Cargo.toml`: the Cargo workspace (its own, `Cargo.lock` committed, exact pins), toolchain in
   `rust-toolchain.toml`.
-- `core/`: `ruchoir-desktop-core`, the logic that needs no window (instances, tokens, sign-in, proxy
-  rules, realtime, opened files). Tested on any machine.
-- `src-tauri/`: `ruchoir-desktop`, the Tauri app wiring the core to windows, the keychain and deep
-  links. Building it needs the system webview development files (on Debian or Ubuntu:
+- `core/`: `ruchoir-desktop-core`, the logic that needs no window (instances from the manifest,
+  the keychain `Storage` of `ruchoir-native`, the hub's live socket and inbox, local copies and the
+  drive's routes, where a window may navigate). Tested on any machine, against stand-ins.
+- `src-tauri/`: `ruchoir-desktop`, the Tauri app wiring the core to the launcher, the product
+  windows, the system browser and notifications. A product window can call no command, except a
+  drive window, which gets the local copies' commands by a capability made at run time. Building it needs the system webview development files (on Debian or Ubuntu:
   `libwebkit2gtk-4.1-dev`, `libayatana-appindicator3-dev`, `librsvg2-dev`, `libsecret-1-dev`).
-- `ui/`: the bundled interface (`frontendDist`). For now a placeholder page: the monolith embedded
-  its web client's export, which this repository must not depend on. The rebuilt shell replaces it.
+- `ui/`: the launcher (`frontendDist`), plain HTML and a JavaScript module, no build step, its six
+  dictionaries in `ui/i18n/`.
 - `e2e/`: the end-to-end run and the lightness budget, for a headless Linux machine.
 - `package.json`: the Tauri CLI only (`tauri dev`, `tauri build`).
 
 ### Boundaries
 
 - As little logic as possible, so that updating a product never requires a new desktop release.
-- Talks to an instance through Propolis and the products' public APIs only.
+- Talks to an instance through Propolis and the products' public APIs only: the hub's manifest,
+  `/api/v1/live/ws` and `/api/v1/me/inbox`; the drive's `/api/v1/files/{id}/download` and
+  `/api/v1/files/{id}/versions`.
+- `Ruchoir/core` crates are pinned by git tag (`ruchoir-native`, `v0.6.0`).
 - Builds run on GitHub's runners (`dependency-exceptions.md`).
 
 ### Decisions that apply
