@@ -911,7 +911,21 @@ mod tests {
                 .unwrap()
                 .set_modified(then)
                 .unwrap();
-            std::fs::File::open(&folder)
+            // Windows opens a folder only with backup semantics, and setting its time needs write
+            // access.
+            let mut folder_options = std::fs::File::options();
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+                folder_options
+                    .write(true)
+                    .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+            }
+            #[cfg(not(windows))]
+            folder_options.read(true);
+            folder_options
+                .open(&folder)
                 .unwrap()
                 .set_modified(then)
                 .unwrap();

@@ -110,14 +110,24 @@ The desktop app for Windows, macOS and Linux: a light Tauri shell with a bar of 
 left, one web view per product taking the whole space, and the option to open a product in its own
 window.
 
-**Status:** empty. During the restructuring this repository only gets its ground: rules,
-configuration and CI. No feature is written or moved here until this app is taken up, one
-project at a time.
+**Status:** `apps/desktop` of `Ruchoir/ruchoir` moved here with its history, as it was. The shell
+is not reworked yet: it is still the monolith's app, minus the monolith's web interface. Next: the
+shell rebuilt as described above, its product logic (opened copies of drive files, their watcher,
+the notifier) moved to the products or behind their APIs.
 
-### What will live here
+### Layout
 
-- From `Ruchoir/ruchoir`: `apps/desktop`, reduced to the shell. Its product logic (opened copies of
-  drive files, their watcher, the notifier) moves to the products or behind their APIs.
+- `Cargo.toml`: the Cargo workspace (its own, `Cargo.lock` committed, exact pins), toolchain in
+  `rust-toolchain.toml`.
+- `core/`: `ruchoir-desktop-core`, the logic that needs no window (instances, tokens, sign-in, proxy
+  rules, realtime, opened files). Tested on any machine.
+- `src-tauri/`: `ruchoir-desktop`, the Tauri app wiring the core to windows, the keychain and deep
+  links. Building it needs the system webview development files (on Debian or Ubuntu:
+  `libwebkit2gtk-4.1-dev`, `libayatana-appindicator3-dev`, `librsvg2-dev`, `libsecret-1-dev`).
+- `ui/`: the bundled interface (`frontendDist`). For now a placeholder page: the monolith embedded
+  its web client's export, which this repository must not depend on. The rebuilt shell replaces it.
+- `e2e/`: the end-to-end run and the lightness budget, for a headless Linux machine.
+- `package.json`: the Tauri CLI only (`tauri dev`, `tauri build`).
 
 ### Boundaries
 
@@ -140,7 +150,8 @@ This repository's own decisions go in `docs/adr/`.
 
 - The conventions check, with a clone of `Ruchoir/.github` at `$RULES`:
   `bash "$RULES/scripts/check-conventions.sh" "$RULES/common-rules.md"`, from the root.
-- The build, lint and test commands arrive with the first code, with the shared `rust` and `node`
-  workflows of `Ruchoir/.github`.
+- `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+  `cargo test --workspace`, and `cargo deny --config "$RULES/deny.toml" check`. On Windows, set
+  `OPENSSL_DIR`. No CI runs the Rust checks yet: run them locally before pushing.
 
 Licence: `AGPL-3.0-only` (`LICENSE`).

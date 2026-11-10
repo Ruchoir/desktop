@@ -3,8 +3,7 @@
   "productName": "Ruchoir",
   "identifier": "com.ruchoir.desktop",
   "build": {
-    "frontendDist": "../../web/out",
-    "beforeBuildCommand": "pnpm --dir ../.. --filter @ruchoir/web build:desktop"
+    "frontendDist": "../ui"
   },
   "app": {
     "windows": [],
