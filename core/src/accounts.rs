@@ -1,6 +1,6 @@
-//! Signing in to an instance with `ruchoir-native` (decision 3 of the shells' plan): RFC 8252 with
-//! Propolis, PKCE, a loopback redirect (`http://127.0.0.1:<port>/callback`), one refresh token per
-//! issuer in the keychain and one access token per product, kept in memory.
+//! Signing in to an instance with `ruchoir-native`: RFC 8252 with Propolis, PKCE, a loopback
+//! redirect (`http://127.0.0.1:<port>/callback`), one refresh token per issuer in the keychain and
+//! one access token per product, kept in memory.
 //!
 //! The sign-in asks a token for the hub and for every installed product at once (`resource`, RFC
 //! 8707): the hub's for the live socket and the inbox, the drive's for the local copies. The

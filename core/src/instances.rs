@@ -1,9 +1,9 @@
 //! The instances the person added, kept in a small JSON file of the app's data directory.
 //!
-//! An instance is what its hub's manifest describes (`/.well-known/ruchoir-manifest`, decision 2 of
-//! the shells' plan): its domain, Propolis's origin (the issuer of its tokens) and its installed
-//! products with their origins. Nothing secret lives here: the grants are in the system's keychain
-//! (`vault.rs`), filed by issuer by `ruchoir-native`.
+//! An instance is what its hub's manifest describes (`/.well-known/ruchoir-manifest`): its domain,
+//! Propolis's origin (the issuer of its tokens) and its installed products with their origins.
+//! Nothing secret lives here: the grants are in the system's keychain (`vault.rs`), filed by issuer
+//! by `ruchoir-native`.
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;

@@ -1,7 +1,7 @@
 //! The products' windows. Opening a product opens a window on its own host
-//! (`https://drive.<domain>`...), which signs in by the product's own browser session (decision 1 of
-//! the shells' plan): the app adds no token to its pages. A window stays on the instance's origins;
-//! a link anywhere else opens in the system browser.
+//! (`https://drive.<domain>`...), which signs in by the product's own browser session: the app adds
+//! no token to its pages. A window stays on the instance's origins; a link anywhere else opens in
+//! the system browser.
 //!
 //! A drive window may call the local copies' commands (`files.rs`), and nothing else: a capability
 //! made at run time for that window and the drive's origin only.
