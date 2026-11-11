@@ -1,7 +1,7 @@
-//! Local copies of drive files (decision 9 of the shells' plan). A drive page asks the app to open a
-//! file with the computer's own app: the app reads its bytes from the drive with the drive access
-//! token, keeps a copy in its cache and opens it; when the person saves it, the drive window is
-//! offered to send it back, which goes up as a new version (`POST /api/v1/files/{id}/versions`).
+//! Local copies of drive files. A drive page asks the app to open a file with the computer's own
+//! app: the app reads its bytes from the drive with the drive access token, keeps a copy in its
+//! cache and opens it; when the person saves it, the drive window is offered to send it back, which
+//! goes up as a new version (`POST /api/v1/files/{id}/versions`).
 //!
 //! These commands are the only ones a drive window may call (`windows.rs`); the instance is the one
 //! of the calling window, never a parameter, so a page acts on its own instance's files only.

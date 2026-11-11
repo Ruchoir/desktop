@@ -1,7 +1,7 @@
 //! Local copies of drive files: what a file name may contain, where a copy is kept, how a save is
-//! told apart from an editor's intermediate writes, and the two drive routes they use (decision 9 of
-//! the shells' plan): `GET /api/v1/files/{id}/download` for the bytes and
-//! `POST /api/v1/files/{id}/versions` for a modified copy, both with the drive access token.
+//! told apart from an editor's intermediate writes, and the two drive routes they use:
+//! `GET /api/v1/files/{id}/download` for the bytes and `POST /api/v1/files/{id}/versions` for a
+//! modified copy, both with the drive access token.
 //!
 //! Kept free of Tauri so they are tested on any machine.
 

@@ -122,11 +122,10 @@ window on the product's own host (`https://drive.<domain>`...), signed in by the
 browser session. The app keeps its own tokens only for what pages do not do: the hub's live socket
 and notifications, and the local copies of drive files.
 
-**Status:** the shell is rebuilt on `ruchoir-native` (phase 6 of the restructuring, decisions 1, 2,
-3 and 9 of its plan): accounts by discovery from the hub's manifest and RFC 8252 sign-in with
-Propolis, the hub's live socket and inbox, drive versions for local copies. The monolith's proxy
-protocol and its token are gone. Not yet: a product rail in one window, the e2e run (`e2e/` still
-drives the monolith's flow).
+**Status:** the shell is rebuilt on `ruchoir-native`: accounts by discovery from the hub's manifest
+and RFC 8252 sign-in with Propolis, the hub's live socket and inbox, drive versions for local
+copies. The monolith's proxy protocol and its token are gone. Not yet: a product rail in one window,
+the e2e run (`e2e/` still drives the monolith's flow).
 
 ### Layout
 
