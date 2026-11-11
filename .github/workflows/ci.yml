@@ -10,4 +10,6 @@ permissions:
 
 jobs:
   conventions:
-    uses: Ruchoir/.github/.github/workflows/conventions.yml@v1
+    uses: Ruchoir/.github/.github/workflows/conventions.yml@v2.0.0
+    with:
+      rules-ref: v2.0.0
